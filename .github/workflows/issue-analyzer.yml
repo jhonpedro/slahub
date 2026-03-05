@@ -1,0 +1,207 @@
+# ---------------------------------------------------------
+# Issue Analyzer Workflow
+# ---------------------------------------------------------
+# Triggers when a new issue is opened. Sends the issue
+# title + body to Claude API for analysis, then posts a
+# clean Slack message with solution buttons (like Google
+# Calendar's Yes/Maybe/No pattern).
+#
+# Required GitHub Secrets:
+#   ANTHROPIC_API_KEY  — Claude API key from console.anthropic.com
+#   SLACK_BOT_TOKEN    — Slack Bot User OAuth Token (xoxb-...)
+#   SLACK_CHANNEL_ID   — Target Slack channel ID (e.g. C0123456789)
+# ---------------------------------------------------------
+
+name: Analyze Issue with Claude
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Analyze issue with Claude
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          # Build the prompt for Claude
+          PROMPT=$(cat <<'PROMPT_EOF'
+          You are a senior software engineer triaging a GitHub issue.
+
+          Analyze the issue below and respond with ONLY valid JSON (no markdown fences):
+          {
+            "type": "bug" | "feature_request" | "question" | "documentation" | "other",
+            "summary": "one-paragraph analysis of the issue",
+            "severity": "critical" | "high" | "medium" | "low",
+            "solutions": [
+              {
+                "title": "short button label (max 30 chars)",
+                "description": "2-3 sentence description of what this solution does"
+              }
+            ]
+          }
+
+          Rules:
+          - If the issue is a question, return an empty solutions array and put the answer in the summary.
+          - For bugs/feature requests, provide exactly 2-3 solutions ordered from simplest to most comprehensive.
+          - Keep solution titles short — they will be button labels.
+          - Be concise and actionable.
+          PROMPT_EOF
+          )
+
+          # Call Claude API
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg prompt "$PROMPT" \
+              --arg title "$ISSUE_TITLE" \
+              --arg body "$ISSUE_BODY" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 1024,
+                messages: [{
+                  role: "user",
+                  content: ($prompt + "\n\nIssue Title: " + $title + "\n\nIssue Body:\n" + $body)
+                }]
+              }'
+            )")
+
+          ANALYSIS=$(echo "$RESPONSE" | jq -r '.content[0].text')
+          echo "$ANALYSIS" > /tmp/analysis.json
+
+          echo "analysis<<ANALYSIS_EOF" >> "$GITHUB_OUTPUT"
+          echo "$ANALYSIS" >> "$GITHUB_OUTPUT"
+          echo "ANALYSIS_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post to Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          REPO_NAME: ${{ github.repository }}
+          ANALYSIS: ${{ steps.claude.outputs.analysis }}
+        run: |
+          TYPE=$(echo "$ANALYSIS" | jq -r '.type')
+          SUMMARY=$(echo "$ANALYSIS" | jq -r '.summary')
+          SEVERITY=$(echo "$ANALYSIS" | jq -r '.severity')
+          SOLUTIONS=$(echo "$ANALYSIS" | jq -c '.solutions')
+          SOLUTION_COUNT=$(echo "$SOLUTIONS" | jq 'length')
+
+          # Emoji per type
+          case "$TYPE" in
+            bug)             EMOJI="🐛" ;;
+            feature_request) EMOJI="✨" ;;
+            question)        EMOJI="❓" ;;
+            documentation)   EMOJI="📄" ;;
+            *)               EMOJI="📋" ;;
+          esac
+
+          # --- Build Slack blocks (clean, Google Calendar style) ---------------
+
+          # Header + issue info
+          BLOCKS=$(jq -n \
+            --arg emoji "$EMOJI" \
+            --arg type "$TYPE" \
+            --arg title "$ISSUE_TITLE" \
+            --arg url "$ISSUE_URL" \
+            --arg number "$ISSUE_NUMBER" \
+            --arg author "$ISSUE_AUTHOR" \
+            --arg summary "$SUMMARY" \
+            --arg severity "$SEVERITY" \
+            '[
+              {
+                type: "section",
+                text: {
+                  type: "mrkdwn",
+                  text: ($emoji + " *<" + $url + "|#" + $number + " " + $title + ">*\nby *@" + $author + "* · `" + $severity + "` · _" + $type + "_")
+                }
+              },
+              {
+                type: "section",
+                text: { type: "mrkdwn", text: $summary }
+              }
+            ]')
+
+          # Add solution buttons if applicable (simple row like Google Calendar)
+          if [ "$SOLUTION_COUNT" -gt 0 ] && [ "$TYPE" != "question" ]; then
+
+            # Each button value carries the full context the worker needs as JSON
+            SOLUTION_BUTTONS=$(echo "$SOLUTIONS" | jq -c \
+              --arg issue_number "$ISSUE_NUMBER" \
+              --arg issue_title "$ISSUE_TITLE" \
+              --arg issue_body "$ISSUE_BODY" \
+              --arg repo "$REPO_NAME" \
+              '[to_entries[] | {
+                type: "button",
+                text: { type: "plain_text", text: .value.title, emoji: true },
+                value: ({
+                  index: .key,
+                  repo: $repo,
+                  issue_number: $issue_number,
+                  issue_title: $issue_title,
+                  solution: .value
+                } | tostring),
+                action_id: ("pick_solution_" + (.key | tostring))
+              }]')
+
+            # Add a "Skip" button
+            SOLUTION_BUTTONS=$(echo "$SOLUTION_BUTTONS" | jq -c \
+              '. + [{
+                type: "button",
+                text: { type: "plain_text", text: "Skip", emoji: true },
+                value: "skip",
+                action_id: "skip_solution"
+              }]')
+
+            BLOCKS=$(echo "$BLOCKS" | jq -c \
+              --argjson buttons "$SOLUTION_BUTTONS" \
+              '. + [
+                { type: "divider" },
+                {
+                  type: "section",
+                  text: { type: "mrkdwn", text: "*Pick a solution to create a PR:*" }
+                },
+                { type: "actions", elements: $buttons }
+              ]')
+
+            # Add solution descriptions as context below buttons
+            SOLUTION_CONTEXT=$(echo "$SOLUTIONS" | jq -c '
+              [to_entries[] |
+                { type: "mrkdwn", text: ("*" + ((.key + 1) | tostring) + ".* " + .value.title + " — " + .value.description) }
+              ]')
+
+            BLOCKS=$(echo "$BLOCKS" | jq -c \
+              --argjson ctx "$SOLUTION_CONTEXT" \
+              '. + [{ type: "context", elements: $ctx }]')
+          fi
+
+          # Post to Slack
+          curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --argjson blocks "$BLOCKS" \
+              --arg text "New issue: $ISSUE_TITLE" \
+              '{ channel: $channel, blocks: $blocks, text: $text }'
+            )"
