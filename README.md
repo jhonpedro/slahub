@@ -4,20 +4,22 @@ AI-powered GitHub issue triage → Slack analysis → one-click PR creation.
 
 When a new issue is opened, Claude analyzes it, proposes 2-3 solutions, and posts
 them to Slack as interactive buttons (similar to Google Calendar's Yes/Maybe/No).
-Clicking a solution triggers Claude to generate code changes and open a PR automatically.
+Clicking a solution triggers a GitHub Action that generates code changes and opens a PR.
 
 ## How It Works
 
 ```
 GitHub Issue opened
-  → GitHub Actions workflow triggers
+  → GitHub Action (issue-analyzer) triggers
     → Claude API analyzes the issue (type, severity, 2-3 solutions)
   → Posts clean Slack message with solution buttons + "Skip"
   → Team member clicks a solution
-    → Cloudflare Worker picks it up
-    → Calls Claude to generate code changes
-    → Creates branch + commits + opens PR on GitHub
-    → Updates Slack message with PR link
+    → Cloudflare Worker fires repository_dispatch to GitHub
+    → Updates Slack with link to GitHub Actions
+  → GitHub Action (create-pr) runs
+    → Checks out full repo
+    → Claude generates code changes with full codebase context
+    → Creates branch + commits + opens PR
 ```
 
 ## Project Structure
@@ -30,10 +32,11 @@ slahub/
 │
 ├── .github/
 │   └── workflows/
-│       └── issue-analyzer.yml        #   CI: issue → Claude analysis → Slack message
+│       ├── issue-analyzer.yml        #   CI: issue → Claude analysis → Slack message
+│       └── create-pr.yml             #   CI: dispatched by worker → Claude codegen → PR
 │
 ├── functions/
-│   ├── slack-interaction-handler.js  #   Cloudflare Worker: Slack button → Claude codegen → GitHub PR
+│   ├── slack-interaction-handler.js  #   Cloudflare Worker: Slack button → dispatch GitHub Action
 │   └── wrangler.toml                 #   Worker config — name, vars, entry point
 │
 ├── .gitignore
@@ -46,20 +49,21 @@ slahub/
 |------|---------|
 | `app/index.html` | Minimal counter app. Exists so the repo has something to file issues against (e.g. "counter doesn't reset", "add a subtract button"). |
 | `app/counter.js` | JavaScript for the counter. Intentionally simple — one variable, one event listener. |
-| `.github/workflows/issue-analyzer.yml` | CI pipeline. On new issue: sends to Claude for classification + solution proposals, posts a clean Slack message with interactive buttons. Each button carries full context (issue + solution) as JSON in its value. |
-| `functions/slack-interaction-handler.js` | Cloudflare Worker. On button click: acknowledges Slack immediately (3s timeout), then in background: calls Claude to generate code changes, creates a Git branch, commits files via GitHub API, opens a PR, and updates the Slack message with the PR link. |
+| `.github/workflows/issue-analyzer.yml` | Triggers on new issues. Sends to Claude for classification + solution proposals, posts a clean Slack message with interactive buttons. Each button carries full context (issue + solution) as JSON in its value. |
+| `.github/workflows/create-pr.yml` | Triggered via `repository_dispatch` from the worker. Checks out the full repo, sends all file contents to Claude for code generation, applies changes, creates a branch, and opens a PR. Has full filesystem access — no file limits. |
+| `functions/slack-interaction-handler.js` | Lightweight Cloudflare Worker. On button click: verifies Slack signature, fires a `repository_dispatch` event to GitHub with the solution details, and updates the Slack message with a link to the Actions tab. |
 | `functions/wrangler.toml` | Cloudflare Worker config. Set `GITHUB_REPO` here. Secrets set via `wrangler secret put`. |
 
 ## Setup
 
-There are 5 secrets/tokens needed across GitHub Actions and the Cloudflare Worker.
+There are 4 secrets/tokens needed across GitHub Actions and the Cloudflare Worker.
 Follow each section below in order.
 
 ---
 
 ### 1. Get your Anthropic API Key
 
-This lets both the GitHub Action and the Worker call Claude.
+This lets the GitHub Actions call Claude for analysis and code generation.
 
 1. Go to [console.anthropic.com](https://console.anthropic.com)
 2. Sign up or log in
@@ -70,13 +74,12 @@ This lets both the GitHub Action and the Worker call Claude.
 
 > **Where it goes:**
 > - GitHub Secret: `ANTHROPIC_API_KEY`
-> - Cloudflare Worker secret: `ANTHROPIC_API_KEY`
 
 ---
 
 ### 2. Create a GitHub Personal Access Token
 
-The Worker uses this to create branches, commit files, and open PRs.
+The Cloudflare Worker uses this to trigger `repository_dispatch` events.
 
 We recommend using a **classic token** — it's simpler and avoids permission quirks with fine-grained tokens.
 
@@ -92,8 +95,8 @@ We recommend using a **classic token** — it's simpler and avoids permission qu
 > **Where it goes:**
 > - Cloudflare Worker secret: `GITHUB_TOKEN`
 
-> **Note:** The GitHub Actions workflow uses the built-in `GITHUB_TOKEN` automatically for issue
-> permissions. This PAT is only for the Cloudflare Worker which runs outside GitHub.
+> **Note:** The GitHub Actions workflows use the built-in `GITHUB_TOKEN` for creating branches and PRs.
+> This classic PAT is only for the Cloudflare Worker to trigger `repository_dispatch`.
 
 ---
 
@@ -166,7 +169,7 @@ This creates the bot that posts messages and receives button clicks.
 
 ### 5. Deploy the Cloudflare Worker
 
-The Worker handles: Slack button click → Claude code generation → GitHub PR.
+The Worker is lightweight — it just receives Slack button clicks and triggers GitHub Actions.
 
 ```bash
 # Install wrangler if you don't have it
@@ -183,7 +186,6 @@ cd functions
 # Set secrets (you'll be prompted to paste each value)
 wrangler secret put SLACK_SIGNING_SECRET    # from step 3c
 wrangler secret put GITHUB_TOKEN            # from step 2
-wrangler secret put ANTHROPIC_API_KEY       # from step 1
 
 # Deploy
 wrangler deploy
@@ -203,8 +205,8 @@ Wrangler prints the Worker URL after deploying (e.g. `https://slahub-slack-handl
 1. Open an issue on the repo: _"The counter doesn't have a reset button"_
 2. Watch the GitHub Action run (~15s) in the **Actions** tab
 3. Check your Slack channel — you'll see the analysis with solution buttons
-4. Click a solution → the message updates to "creating PR..."
-5. After a few seconds → the message updates with a link to the new PR
+4. Click a solution → the message updates with a link to GitHub Actions
+5. Follow the link to watch the PR creation workflow
 6. Review the PR on GitHub
 
 ### Troubleshooting
@@ -214,15 +216,17 @@ Wrangler prints the Worker URL after deploying (e.g. `https://slahub-slack-handl
 | Action runs but no Slack message | Verify `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` are correct in GitHub Secrets |
 | Slack message appears but buttons don't work | Ensure Interactivity is ON and the Request URL matches your Worker URL |
 | "Invalid signature" in Worker logs | Verify `SLACK_SIGNING_SECRET` matches your Slack App's signing secret |
-| PR creation fails | Check that `GITHUB_TOKEN` has `contents: write` and `pull_requests: write` on the repo |
-| Claude returns errors | Verify `ANTHROPIC_API_KEY` is valid and has credits |
+| Dispatch fails (404) | Check that `GITHUB_TOKEN` in the worker has `repo` scope and `GITHUB_REPO` is in `owner/repo` format |
+| PR creation workflow fails | Check `ANTHROPIC_API_KEY` is valid and has credits in GitHub Secrets |
+
+> **Tip:** Use `wrangler tail` to stream live Worker logs while debugging.
 
 ---
 
 ## Customization
 
-- **Change the Claude model**: edit `model` in `issue-analyzer.yml` and `slack-interaction-handler.js`
-- **Change the analysis prompt**: edit the `PROMPT` variable in the workflow
-- **Change the code generation prompt**: edit `callClaude()` in the worker
-- **Add more issue types**: extend the JSON schema in the workflow prompt
-- **Route to different channels**: add logic based on `type` or `severity` in the workflow
+- **Change the Claude model**: edit `model` in `issue-analyzer.yml` and `create-pr.yml`
+- **Change the analysis prompt**: edit the `PROMPT` variable in `issue-analyzer.yml`
+- **Change the code generation prompt**: edit the `PROMPT` variable in `create-pr.yml`
+- **Add more issue types**: extend the JSON schema in the analysis prompt
+- **Route to different channels**: add logic based on `type` or `severity` in `issue-analyzer.yml`

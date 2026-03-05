@@ -8,4 +8,3 @@ GITHUB_REPO = "jhonpedro/slahub" # Change to your actual repo
 # Secrets are NOT stored here — set them via CLI:
 #   wrangler secret put SLACK_SIGNING_SECRET
 #   wrangler secret put GITHUB_TOKEN
-#   wrangler secret put ANTHROPIC_API_KEY

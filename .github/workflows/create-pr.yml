@@ -1,0 +1,300 @@
+# ---------------------------------------------------------
+# Create PR Workflow
+# ---------------------------------------------------------
+# Triggered by the Cloudflare Worker via repository_dispatch
+# when a user picks a solution in Slack.
+#
+# Uses Claude tool_use so Claude can explore the repo on
+# demand — reads only the files it needs, works on any
+# repo size.
+#
+# Required GitHub Secrets:
+#   ANTHROPIC_API_KEY  — Claude API key
+# ---------------------------------------------------------
+
+name: Create PR from Solution
+
+on:
+  repository_dispatch:
+    types: [create_pr]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate changes with Claude (tool use)
+        id: generate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          ISSUE_TITLE: ${{ github.event.client_payload.issue_title }}
+          SOLUTION_TITLE: ${{ github.event.client_payload.solution_title }}
+          SOLUTION_DESC: ${{ github.event.client_payload.solution_description }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by }}
+        run: |
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "triggered_by=$TRIGGERED_BY" >> "$GITHUB_OUTPUT"
+          echo "solution_title=$SOLUTION_TITLE" >> "$GITHUB_OUTPUT"
+
+          # Build the file tree for Claude
+          FILE_TREE=$(find . -type f \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            -not -path './package-lock.json' \
+            | sort)
+
+          # Run the tool-use loop via a Node script
+          node - <<'SCRIPT'
+          const fs = require("fs");
+          const path = require("path");
+
+          const API_KEY = process.env.ANTHROPIC_API_KEY;
+          const ISSUE_NUMBER = process.env.ISSUE_NUMBER;
+          const ISSUE_TITLE = process.env.ISSUE_TITLE;
+          const SOLUTION_TITLE = process.env.SOLUTION_TITLE;
+          const SOLUTION_DESC = process.env.SOLUTION_DESC;
+          const FILE_TREE = process.env.FILE_TREE;
+
+          const tools = [
+            {
+              name: "read_file",
+              description: "Read the contents of a file in the repository. Use this to explore the codebase and understand existing code before making changes.",
+              input_schema: {
+                type: "object",
+                properties: {
+                  path: {
+                    type: "string",
+                    description: "Relative file path from repo root (e.g. 'app/counter.js')"
+                  }
+                },
+                required: ["path"]
+              }
+            },
+            {
+              name: "list_directory",
+              description: "List files and subdirectories in a directory.",
+              input_schema: {
+                type: "object",
+                properties: {
+                  path: {
+                    type: "string",
+                    description: "Relative directory path from repo root (e.g. 'app' or '.')"
+                  }
+                },
+                required: ["path"]
+              }
+            },
+            {
+              name: "submit_changes",
+              description: "Submit the final file changes to be applied as a PR. Call this once you have all the changes ready.",
+              input_schema: {
+                type: "object",
+                properties: {
+                  files: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        path: { type: "string", description: "File path relative to repo root" },
+                        action: { type: "string", enum: ["update", "create"], description: "Whether updating an existing file or creating a new one" },
+                        reason: { type: "string", description: "Short explanation of the change" },
+                        content: { type: "string", description: "Complete file content after changes" }
+                      },
+                      required: ["path", "action", "reason", "content"]
+                    }
+                  }
+                },
+                required: ["files"]
+              }
+            }
+          ];
+
+          function handleToolCall(name, input) {
+            if (name === "read_file") {
+              const filePath = path.resolve(input.path);
+              try {
+                return fs.readFileSync(filePath, "utf-8");
+              } catch (e) {
+                return `Error: file not found — ${input.path}`;
+              }
+            }
+            if (name === "list_directory") {
+              const dirPath = path.resolve(input.path);
+              try {
+                const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+                return entries
+                  .map(e => e.isDirectory() ? `${e.name}/` : e.name)
+                  .join("\n");
+              } catch (e) {
+                return `Error: directory not found — ${input.path}`;
+              }
+            }
+            if (name === "submit_changes") {
+              return JSON.stringify(input);
+            }
+            return "Unknown tool";
+          }
+
+          async function callClaude(messages) {
+            const res = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+              },
+              body: JSON.stringify({
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 8192,
+                tools,
+                messages,
+              }),
+            });
+            return res.json();
+          }
+
+          async function main() {
+            const systemPrompt = `You are a senior software engineer implementing a solution for a GitHub issue.
+
+          Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+          Solution: ${SOLUTION_TITLE}
+          Description: ${SOLUTION_DESC}
+
+          Repository file tree:
+          ${FILE_TREE}
+
+          Instructions:
+          1. Use read_file to explore the relevant files in the repo.
+          2. Understand the existing code structure and patterns.
+          3. When you have a clear plan, use submit_changes with all file modifications.
+          4. Return COMPLETE file contents for each changed file (not diffs).
+          5. Keep changes minimal and focused on the solution.
+          6. Do not change unrelated code.`;
+
+            let messages = [
+              { role: "user", content: systemPrompt }
+            ];
+
+            const MAX_TURNS = 30;
+            for (let turn = 0; turn < MAX_TURNS; turn++) {
+              console.log(`Turn ${turn + 1}...`);
+              const response = await callClaude(messages);
+
+              if (response.error) {
+                console.error("API error:", JSON.stringify(response.error));
+                process.exit(1);
+              }
+
+              // Check if Claude wants to use tools
+              if (response.stop_reason === "tool_use") {
+                // Add assistant message
+                messages.push({ role: "assistant", content: response.content });
+
+                // Process each tool call
+                const toolResults = [];
+                for (const block of response.content) {
+                  if (block.type === "tool_use") {
+                    console.log(`  → ${block.name}(${JSON.stringify(block.input)})`);
+                    const result = handleToolCall(block.name, block.input);
+
+                    // If submit_changes was called, we're done
+                    if (block.name === "submit_changes") {
+                      console.log("Changes submitted.");
+                      fs.writeFileSync("/tmp/changes.json", result);
+                      process.exit(0);
+                    }
+
+                    toolResults.push({
+                      type: "tool_result",
+                      tool_use_id: block.id,
+                      content: result,
+                    });
+                  }
+                }
+
+                messages.push({ role: "user", content: toolResults });
+              } else {
+                // end_turn without tool use — Claude might have submitted via text
+                // Try to extract JSON from the last text block
+                const textBlock = response.content.find(b => b.type === "text");
+                if (textBlock) {
+                  console.log("Claude responded with text (no tool call). Ending.");
+                  console.log(textBlock.text.slice(0, 200));
+                }
+                console.error("Claude ended without calling submit_changes.");
+                process.exit(1);
+              }
+            }
+
+            console.error("Max turns reached without submit_changes.");
+            process.exit(1);
+          }
+
+          main();
+          SCRIPT
+
+      - name: Apply changes and create PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.generate.outputs.issue_number }}
+          TRIGGERED_BY: ${{ steps.generate.outputs.triggered_by }}
+          SOLUTION_TITLE: ${{ steps.generate.outputs.solution_title }}
+        run: |
+          # Parse the changes JSON
+          CHANGES=$(cat /tmp/changes.json)
+          FILE_COUNT=$(echo "$CHANGES" | jq '.files | length')
+
+          if [ "$FILE_COUNT" -eq 0 ] || [ "$FILE_COUNT" = "null" ]; then
+            echo "::error::No file changes generated"
+            exit 1
+          fi
+
+          # Create branch
+          BRANCH="slahub/issue-${ISSUE_NUMBER}-$(echo "$SOLUTION_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | head -c 40)"
+          git checkout -b "$BRANCH"
+
+          # Apply each file change
+          PR_BODY="## Summary\n\n"
+          for i in $(seq 0 $((FILE_COUNT - 1))); do
+            FILE_PATH=$(echo "$CHANGES" | jq -r ".files[$i].path")
+            FILE_ACTION=$(echo "$CHANGES" | jq -r ".files[$i].action")
+            FILE_REASON=$(echo "$CHANGES" | jq -r ".files[$i].reason")
+            FILE_CONTENT=$(echo "$CHANGES" | jq -r ".files[$i].content")
+
+            # Create directories if needed
+            mkdir -p "$(dirname "$FILE_PATH")"
+
+            # Write file content
+            printf '%s' "$FILE_CONTENT" > "$FILE_PATH"
+
+            PR_BODY="${PR_BODY}- **${FILE_ACTION}** \`${FILE_PATH}\` — ${FILE_REASON}\n"
+          done
+
+          PR_BODY="${PR_BODY}\n---\nCloses #${ISSUE_NUMBER}\nSelected by @${TRIGGERED_BY} via Slack\n_Generated by SlaHub_"
+
+          # Commit and push
+          git config user.name "SlaHub Bot"
+          git config user.email "slahub[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: ${SOLUTION_TITLE} (#${ISSUE_NUMBER})"
+          git push origin "$BRANCH"
+
+          # Create PR
+          gh pr create \
+            --title "fix: ${SOLUTION_TITLE} (#${ISSUE_NUMBER})" \
+            --body "$(echo -e "$PR_BODY")" \
+            --base main \
+            --head "$BRANCH"
