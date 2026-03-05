@@ -17,8 +17,54 @@
 //   GITHUB_REPO           — "owner/repo" format
 // ---------------------------------------------------------
 
+// ==========================================================================
+// Types
+// ==========================================================================
+
+interface Env {
+  SLACK_SIGNING_SECRET: string;
+  GITHUB_TOKEN: string;
+  GITHUB_REPO: string;
+}
+
+interface SlackAction {
+  value: string;
+}
+
+interface SlackBlock {
+  type: string;
+  text?: { type: string; text: string };
+  elements?: unknown[];
+}
+
+interface SlackPayload {
+  type: string;
+  actions: SlackAction[];
+  response_url: string;
+  user: { name: string };
+  message: { blocks: SlackBlock[] };
+}
+
+interface SolutionContext {
+  repo?: string;
+  issue_number: string;
+  issue_title: string;
+  solution: {
+    title: string;
+    description: string;
+  };
+}
+
+// ==========================================================================
+// Worker
+// ==========================================================================
+
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
     }
@@ -42,7 +88,9 @@ export default {
 
     // --- Parse payload ----------------------------------------------------
     const params = new URLSearchParams(rawBody);
-    const payload = JSON.parse(params.get("payload") || rawBody);
+    const payload: SlackPayload = JSON.parse(
+      params.get("payload") || rawBody,
+    );
 
     if (payload.type !== "block_actions") {
       return new Response("ok", { status: 200 });
@@ -63,7 +111,7 @@ export default {
     }
 
     // --- Parse solution context from button value -------------------------
-    let context;
+    let context: SolutionContext;
     try {
       context = JSON.parse(action.value);
     } catch {
@@ -79,7 +127,6 @@ export default {
     ctx.waitUntil(
       (async () => {
         try {
-          // Trigger the create-pr workflow via repository_dispatch
           const res = await fetch(
             `https://api.github.com/repos/${targetRepo}/dispatches`,
             {
@@ -112,8 +159,10 @@ export default {
             text: `🚀 *@${user}* picked: *${solution.title}*\n⚙️ PR creation started — <${actionsUrl}|view progress in GitHub Actions>`,
           });
         } catch (err) {
+          const message =
+            err instanceof Error ? err.message : "Unknown error";
           await updateSlackMessage(responseUrl, messageBlocks, {
-            text: `❌ *@${user}* picked: *${solution.title}* — failed to trigger: ${err.message}`,
+            text: `❌ *@${user}* picked: *${solution.title}* — failed to trigger: ${message}`,
           });
         }
       })(),
@@ -127,7 +176,11 @@ export default {
 // Update Slack message — removes buttons, appends status text
 // ==========================================================================
 
-async function updateSlackMessage(responseUrl, originalBlocks, { text }) {
+async function updateSlackMessage(
+  responseUrl: string,
+  originalBlocks: SlackBlock[],
+  { text }: { text: string },
+): Promise<void> {
   const updatedBlocks = [
     ...originalBlocks.filter(
       (b) => b.type !== "actions" && b.type !== "context",
@@ -150,7 +203,14 @@ async function updateSlackMessage(responseUrl, originalBlocks, { text }) {
 // Slack signature verification (Web Crypto API)
 // ==========================================================================
 
-async function verifySlackSignature(signingSecret, signature, timestamp, body) {
+async function verifySlackSignature(
+  signingSecret: string,
+  signature: string | null,
+  timestamp: string | null,
+  body: string,
+): Promise<boolean> {
+  if (!signature || !timestamp) return false;
+
   const encoder = new TextEncoder();
   const baseString = `v0:${timestamp}:${body}`;
 

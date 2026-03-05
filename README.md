@@ -33,10 +33,13 @@ slahub/
 ├── .github/
 │   └── workflows/
 │       ├── issue-analyzer.yml        #   CI: issue → Claude analysis → Slack message
-│       └── create-pr.yml             #   CI: dispatched by worker → Claude codegen → PR
+│       └── create-pr.yml             #   CI: dispatched by worker → runs generate script → PR
+│
+├── scripts/
+│   └── generate-changes.ts           #   Claude tool-use loop: explores repo, generates file changes
 │
 ├── functions/
-│   ├── slack-interaction-handler.js  #   Cloudflare Worker: Slack button → dispatch GitHub Action
+│   ├── slack-interaction-handler.ts  #   Cloudflare Worker: Slack button → dispatch GitHub Action
 │   └── wrangler.toml                 #   Worker config — name, vars, entry point
 │
 ├── .gitignore
@@ -50,8 +53,9 @@ slahub/
 | `app/index.html` | Minimal counter app. Exists so the repo has something to file issues against (e.g. "counter doesn't reset", "add a subtract button"). |
 | `app/counter.js` | JavaScript for the counter. Intentionally simple — one variable, one event listener. |
 | `.github/workflows/issue-analyzer.yml` | Triggers on new issues. Sends to Claude for classification + solution proposals, posts a clean Slack message with interactive buttons. Each button carries full context (issue + solution) as JSON in its value. |
-| `.github/workflows/create-pr.yml` | Triggered via `repository_dispatch` from the worker. Checks out the full repo, sends all file contents to Claude for code generation, applies changes, creates a branch, and opens a PR. Has full filesystem access — no file limits. |
-| `functions/slack-interaction-handler.js` | Lightweight Cloudflare Worker. On button click: verifies Slack signature, fires a `repository_dispatch` event to GitHub with the solution details, and updates the Slack message with a link to the Actions tab. |
+| `.github/workflows/create-pr.yml` | Triggered via `repository_dispatch` from the worker. Checks out the repo, runs `scripts/generate-changes.ts`, applies the output, and creates a branch + PR. |
+| `scripts/generate-changes.ts` | Claude tool-use loop. Fetches the full issue (body, comments, images) from GitHub API, gives Claude `read_file` and `list_directory` tools to explore the repo on demand, then collects the final changes via `submit_changes`. Supports vision — images attached to the issue are sent to Claude. |
+| `functions/slack-interaction-handler.ts` | Lightweight Cloudflare Worker. On button click: verifies Slack signature, fires a `repository_dispatch` event to GitHub with the solution details, and updates the Slack message with a link to the Actions tab. |
 | `functions/wrangler.toml` | Cloudflare Worker config. Set `GITHUB_REPO` here. Secrets set via `wrangler secret put`. |
 
 ## Setup

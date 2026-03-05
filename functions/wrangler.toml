@@ -1,5 +1,5 @@
 name = "slahub-slack-handler"
-main = "slack-interaction-handler.js"
+main = "slack-interaction-handler.ts"
 compatibility_date = "2024-01-01"
 
 [vars]
