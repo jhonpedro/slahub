@@ -78,19 +78,16 @@ This lets both the GitHub Action and the Worker call Claude.
 
 The Worker uses this to create branches, commit files, and open PRs.
 
-1. Go to [github.com/settings/tokens?type=beta](https://github.com/settings/tokens?type=beta) (Fine-grained tokens)
-2. Click **Generate new token**
+We recommend using a **classic token** — it's simpler and avoids permission quirks with fine-grained tokens.
+
+1. Go to [github.com/settings/tokens](https://github.com/settings/tokens) (Tokens classic)
+2. Click **Generate new token** → **Generate new token (classic)**
 3. Set:
-   - **Token name:** `slahub-worker`
+   - **Note:** `slahub-worker`
    - **Expiration:** 90 days (or custom)
-   - **Repository access:** select **Only select repositories** → pick your slahub repo
-   - **Permissions → Repository permissions:**
-     - `Contents` → **Read and write** (to create branches and commit files)
-     - `Pull requests` → **Read and write** (to open PRs)
-     - `Issues` → **Read and write** (to comment on issues)
-     - `Metadata` → **Read-only** (required, auto-selected)
+   - **Scopes:** check `repo` (full control of private repositories)
 4. Click **Generate token**
-5. Copy the token — it starts with `github_pat_...`
+5. Copy the token immediately — it starts with `ghp_...` and is only shown once
 
 > **Where it goes:**
 > - Cloudflare Worker secret: `GITHUB_TOKEN`

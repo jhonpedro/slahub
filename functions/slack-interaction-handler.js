@@ -293,7 +293,8 @@ Rules:
 
 function githubAPI(token, repo) {
   return async (method, endpoint, body) => {
-    const url = `https://api.github.com/repos/${repo}/${endpoint}`;
+    const base = `https://api.github.com/repos/${repo}`;
+    const url = endpoint ? `${base}/${endpoint}` : base;
     const res = await fetch(url, {
       method,
       headers: {
